@@ -18,11 +18,12 @@
  *   ./reproducer /path/to/parquet/files [iterations] [parallel_threads]
  */
 
-#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_pool.hpp>
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
 #include <rmm/mr/device/per_device_resource.hpp>
 
@@ -108,14 +109,17 @@ void read_parquet_file(const std::string& filepath, int iteration,
   }
 }
 
+// Global stream pool (created in main)
+std::unique_ptr<rmm::cuda_stream_pool> stream_pool;
+
 // Worker thread function
 void worker_thread(const std::vector<std::string>& files,
                    int iterations,
                    int thread_id,
                    int num_threads,
                    rmm::device_async_resource_ref mr) {
-  // Each thread gets its own stream from the global pool
-  auto stream = cudf::detail::global_cuda_stream_pool().get_stream();
+  // Each thread gets its own stream from the pool
+  auto stream = stream_pool->get_stream();
 
   for (int iter = 1; iter <= iterations; iter++) {
     // Distribute files across threads
@@ -145,6 +149,9 @@ int main(int argc, char* argv[]) {
   std::cout << "Setting up CUDA async memory resource...\n";
   auto async_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>();
   rmm::mr::set_current_device_resource(async_mr.get());
+
+  // Create stream pool (like Velox uses)
+  stream_pool = std::make_unique<rmm::cuda_stream_pool>(num_threads);
 
   // Collect parquet files
   std::cout << "Collecting parquet files from: " << parquet_path << "\n";
