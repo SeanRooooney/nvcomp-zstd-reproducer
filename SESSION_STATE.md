@@ -1,5 +1,7 @@
 # Session State: nvCOMP ZSTD Decompression Investigation
 
+**Last Updated**: 2026-04-29
+
 ## Problem Summary
 
 Intermittent "Error during decompression" when reading ZSTD-compressed Parquet files via Prestissimo/Velox using cuDF/nvCOMP.
@@ -21,6 +23,9 @@ VeloxRuntimeError: CUDF failure at: /prestissimo/_build/_deps/cudf-src/cpp/src/i
 - **nvCOMP**: 5.2.0.10 (dev) / 5.2.0.13 (runtime)
 - **Source data**: IBM watsonx.data / Presto with Iceberg table format
 - **Compression**: ZSTD (level unknown, likely default 3)
+- **Velox Chunk Limits**:
+  - `PARQUET_READER_CHUNK_READ_LIMIT`: 4GB (4294967296)
+  - `PARQUET_READER_PASS_READ_LIMIT`: 16GB (17179869184)
 
 ## Root Cause Investigation
 
@@ -61,15 +66,32 @@ From [nvCOMP release notes](https://docs.nvidia.com/cuda/nvcomp/release_notes.ht
   - `rmm::mr::cuda_async_memory_resource`
   - `rmm::cuda_stream_pool` for per-thread streams
   - Multi-threaded parallel reads
-- **Status**: Currently running tests
+  - Now uses Velox's chunk/pass read limits (4GB/16GB)
+- **Status**: Extensive testing with no failures
+
+### 3. Stress Testing Results
+Ran 4 concurrent C++ reproducer processes:
+- Total GPU memory usage: ~55GB (18GB + 16GB + 15GB + 5GB)
+- GPU utilization: 100% (800%+ compute)
+- **Result**: No failures reproduced even under heavy load
+
+### Key Finding
+**The standalone reproducers (both Python and C++) cannot trigger the failure**, even under extreme GPU memory pressure and high concurrency. This strongly suggests the issue is specific to Velox's integration layer, not cuDF/nvCOMP itself.
 
 ## Hypotheses
 
-1. **Race condition** in nvCOMP zstd decompression kernel
-2. **GPU memory pressure** - scratch space allocation varies based on memory state
-3. **Uninitialized memory** - buffer contents not properly initialized
-4. **Stream synchronization** - async CUDA operations not properly synchronized
-5. **Velox-specific integration** - something in how Velox calls libcudf
+### Ruled Out (by reproducer testing)
+1. ~~**Race condition** in nvCOMP zstd decompression kernel~~ - Would have appeared in C++ reproducer
+2. ~~**GPU memory pressure** - scratch space allocation varies~~ - Tested at 55GB+ usage, no failures
+3. ~~**cuDF chunked_parquet_reader bug**~~ - Works fine in isolation
+
+### Still Possible (Velox-specific)
+4. **Velox's BufferedInputDataSource** - async I/O layer wrapping cuDF data sources
+5. **Velox's memory pool wrapper** - may interact differently with rmm
+6. **Velox's TableScan operator** - concurrent operators, task scheduling
+7. **AST filter pushdown** - reproducer doesn't use filters
+8. **Stream synchronization in Velox** - async CUDA operations between Velox and cuDF
+9. **Data source lifecycle** - how Velox manages cuDF data source objects
 
 ## How the C++ Reproducer Works
 
@@ -130,15 +152,19 @@ Inside `reader.read_chunk()` when nvCOMP tries to decompress ZSTD-compressed Par
 
 ## Next Steps
 
-1. Run C++ reproducer with many iterations to see if it triggers the failure
-2. If C++ reproducer doesn't fail, the issue may be specific to Velox integration:
-   - Check Velox's memory pool configuration
-   - Check concurrent query handling
-   - Add logging to capture nvCOMP error codes
-3. If C++ reproducer does fail, file a cuDF/nvCOMP bug report with:
-   - Reproducer code
-   - Sample failing Parquet file
-   - Environment details
+Since the standalone reproducers cannot trigger the failure, investigation must move to Velox level:
+
+1. **Create a Velox-level reproducer** - Use Velox's TableScan directly instead of raw cuDF
+2. **Examine Velox's BufferedInputDataSource** - Check async I/O handling
+3. **Add nvCOMP error code logging** - Modify cuDF or Velox to capture actual error codes
+4. **Check for specific query patterns** - Does it only fail with certain filters or projections?
+5. **Examine concurrent query behavior** - Does it only fail when multiple queries run?
+6. **Review Velox's CUDA stream management** - Stream synchronization between components
+
+### Files to Investigate in Velox
+- `velox/experimental/cudf/connectors/hive/CudfHiveDataSource.cpp`
+- `velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.cpp`
+- `velox/experimental/cudf/exec/GpuResources.cpp`
 
 ## Useful Commands
 
