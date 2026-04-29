@@ -71,12 +71,62 @@ From [nvCOMP release notes](https://docs.nvidia.com/cuda/nvcomp/release_notes.ht
 4. **Stream synchronization** - async CUDA operations not properly synchronized
 5. **Velox-specific integration** - something in how Velox calls libcudf
 
+## How the C++ Reproducer Works
+
+### Setup
+```cpp
+// Create async memory allocator (same as Velox)
+auto async_mr = rmm::mr::cuda_async_memory_resource();
+
+// Create pool of CUDA streams (one per thread)
+stream_pool = rmm::cuda_stream_pool(num_threads);
+```
+
+### Per Thread (in parallel)
+```cpp
+// Get a dedicated CUDA stream
+auto stream = stream_pool->get_stream();
+
+// Loop through iterations
+for (iteration = 1 to N) {
+    // Read assigned files
+    for (file in my_files) {
+        // Create chunked reader (same as Velox uses)
+        cudf::io::chunked_parquet_reader reader(0, 0, options, stream, mr);
+
+        // Read all chunks
+        while (reader.has_next()) {
+            auto chunk = reader.read_chunk();  // <-- decompression happens here
+            total_rows += chunk.num_rows();
+        }
+    }
+}
+```
+
+### What It Tests
+- Multiple threads reading Parquet files concurrently
+- Each thread uses its own CUDA stream
+- All threads share the async memory allocator
+- Creates GPU memory pressure and concurrent decompression operations
+
+### What It Does NOT Test (compared to Velox)
+- Column projection / filtering
+- Velox's specific memory pool settings
+- Multiple concurrent queries
+- The exact chunking limits Velox uses (`maxChunkReadLimit`, `maxPassReadLimit`)
+- AST filter pushdown
+- Velox memory pool integration
+
+### Where Decompression Failure Would Occur
+Inside `reader.read_chunk()` when nvCOMP tries to decompress ZSTD-compressed Parquet pages.
+
 ## Files in This Repo
 
 - `reproducer.py` - Python cuDF reproducer
 - `reproducer.cpp` - C++ libcudf reproducer (closer to Velox)
 - `CMakeLists.txt` - CMake build configuration
 - `build.sh` - Build script for Prestissimo environment
+- `SESSION_STATE.md` - This file
 
 ## Next Steps
 
