@@ -116,6 +116,10 @@ void read_parquet_file(const std::string& filepath, int iteration,
 // Global stream pool (created in main)
 std::unique_ptr<rmm::cuda_stream_pool> stream_pool;
 
+// Track iteration progress
+std::atomic<int> completed_iterations{0};
+int total_iterations = 0;
+
 // Worker thread function
 void worker_thread(const std::vector<std::string>& files,
                    int iterations,
@@ -129,6 +133,14 @@ void worker_thread(const std::vector<std::string>& files,
     // Distribute files across threads
     for (size_t i = thread_id; i < files.size(); i += num_threads) {
       read_parquet_file(files[i], iter, stream, mr);
+    }
+
+    // Thread 0 reports progress after each iteration
+    if (thread_id == 0) {
+      int completed = ++completed_iterations;
+      std::cout << "Iteration " << completed << "/" << total_iterations
+                << " (successes: " << success_count.load()
+                << ", failures: " << failure_count.load() << ")\n";
     }
   }
 }
@@ -161,6 +173,8 @@ int main(int argc, char* argv[]) {
 
   std::cout << "Chunk read limit: " << (chunk_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Pass read limit: " << (pass_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
+
+  total_iterations = iterations;
 
   // Setup async memory resource (like Velox does)
   std::cout << "Setting up CUDA async memory resource...\n";
