@@ -72,6 +72,12 @@ std::vector<std::string> collect_parquet_files(const std::string& path) {
   return files;
 }
 
+// Velox/Prestissimo chunk limits (from environment or defaults)
+// PARQUET_READER_CHUNK_READ_LIMIT=4294967296 (4GB)
+// PARQUET_READER_PASS_READ_LIMIT=17179869184 (16GB)
+std::size_t chunk_read_limit = 4294967296UL;   // 4GB
+std::size_t pass_read_limit = 17179869184UL;   // 16GB
+
 // Read a single parquet file using chunked reader (like Velox does)
 void read_parquet_file(const std::string& filepath, int iteration,
                        rmm::cuda_stream_view stream,
@@ -81,10 +87,8 @@ void read_parquet_file(const std::string& filepath, int iteration,
     auto source = cudf::io::source_info(filepath);
     auto options = cudf::io::parquet_reader_options::builder(source).build();
 
-    // Use chunked reader like Velox does
-    // chunk_read_limit = 0 means no limit (read all at once)
-    // pass_read_limit = 0 means no limit
-    cudf::io::chunked_parquet_reader reader(0, 0, options, stream, mr);
+    // Use chunked reader like Velox does with same limits
+    cudf::io::chunked_parquet_reader reader(chunk_read_limit, pass_read_limit, options, stream, mr);
 
     int64_t total_rows = 0;
     while (reader.has_next()) {
@@ -132,18 +136,31 @@ void worker_thread(const std::vector<std::string>& files,
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0]
-              << " <parquet_path> [iterations] [parallel_threads]\n";
+              << " <parquet_path> [iterations] [parallel_threads] [chunk_limit_gb] [pass_limit_gb]\n";
     std::cerr << "\n";
     std::cerr << "Arguments:\n";
     std::cerr << "  parquet_path      Path to parquet file or directory\n";
     std::cerr << "  iterations        Number of iterations (default: 100)\n";
     std::cerr << "  parallel_threads  Number of parallel threads (default: 4)\n";
+    std::cerr << "  chunk_limit_gb    Chunk read limit in GB (default: 4, Velox default)\n";
+    std::cerr << "  pass_limit_gb     Pass read limit in GB (default: 16, Velox default)\n";
     return 1;
   }
 
   std::string parquet_path = argv[1];
   int iterations = (argc > 2) ? std::stoi(argv[2]) : 100;
   int num_threads = (argc > 3) ? std::stoi(argv[3]) : 4;
+
+  // Allow overriding chunk limits via command line (in GB)
+  if (argc > 4) {
+    chunk_read_limit = static_cast<std::size_t>(std::stod(argv[4]) * 1024 * 1024 * 1024);
+  }
+  if (argc > 5) {
+    pass_read_limit = static_cast<std::size_t>(std::stod(argv[5]) * 1024 * 1024 * 1024);
+  }
+
+  std::cout << "Chunk read limit: " << (chunk_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
+  std::cout << "Pass read limit: " << (pass_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
 
   // Setup async memory resource (like Velox does)
   std::cout << "Setting up CUDA async memory resource...\n";
