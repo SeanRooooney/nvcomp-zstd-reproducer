@@ -26,9 +26,24 @@ From [nvCOMP release notes](https://docs.nvidia.com/cuda/nvcomp/release_notes.ht
 
 Note: The documented issue is deterministic, but our observed behavior is intermittent, suggesting a potentially different (or related) root cause.
 
+## Reproducers
+
+Two reproducers are provided:
+
+1. **Python** (`reproducer.py`) - Uses cuDF Python bindings
+2. **C++** (`reproducer.cpp`) - Uses libcudf directly, closer to Velox/Prestissimo
+
+The C++ reproducer mimics how Velox reads Parquet files:
+- Uses `cudf::io::chunked_parquet_reader`
+- Uses `rmm::mr::cuda_async_memory_resource` (async memory)
+- Uses streams from `cudf::detail::global_cuda_stream_pool()`
+- Multi-threaded parallel reads
+
 ## Setup
 
-### Option 1: Conda (recommended)
+### Python Setup
+
+#### Option 1: Conda (recommended)
 
 ```bash
 conda create -n cudf_test python=3.11
@@ -36,13 +51,35 @@ conda activate cudf_test
 conda install -c rapidsai -c conda-forge -c nvidia cudf=26.06 python=3.11 cuda-version=12.0
 ```
 
-### Option 2: pip
+#### Option 2: pip
 
 ```bash
 pip install cudf-cu12 --extra-index-url=https://pypi.nvidia.com
 ```
 
+### C++ Setup
+
+Requires cuDF and RMM libraries installed. Build with CMake:
+
+```bash
+mkdir build && cd build
+cmake .. -DCUDF_INCLUDE_DIR=/path/to/cudf/include \
+         -DCUDF_LIBRARY=/path/to/cudf/lib/libcudf.so \
+         -DRMM_INCLUDE_DIR=/path/to/rmm/include
+make
+```
+
+Or if cudf/rmm are installed system-wide or via conda:
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
+
 ## Usage
+
+### Python
 
 ```bash
 # Basic usage - run 100 iterations on all parquet files in a directory
@@ -51,11 +88,24 @@ python reproducer.py /path/to/parquet/files
 # Specify number of iterations
 python reproducer.py /path/to/parquet/files --iterations 500
 
+# Parallel reads (stress GPU)
+python reproducer.py /path/to/parquet/files --iterations 100 --parallel 8
+
 # Verbose output (show each file read)
 python reproducer.py /path/to/parquet/files --verbose
 
 # Single file
 python reproducer.py /path/to/file.parquet --iterations 1000
+```
+
+### C++
+
+```bash
+# Basic usage
+./reproducer /path/to/parquet/files
+
+# Specify iterations and threads
+./reproducer /path/to/parquet/files 100 8
 ```
 
 ## Expected Output
