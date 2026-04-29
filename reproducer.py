@@ -17,8 +17,10 @@ Environment:
 import argparse
 import glob
 import os
+import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def main():
@@ -34,6 +36,17 @@ def main():
         type=int,
         default=100,
         help="Number of iterations to run (default: 100)",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Number of parallel readers (default: 1, use higher to stress GPU)",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle file order each iteration",
     )
     parser.add_argument(
         "--verbose",
@@ -79,6 +92,19 @@ def main():
     print(f"Total size: {total_size:,} bytes ({total_size / 1024 / 1024:.2f} MB)")
     print()
 
+    # Helper function to read a single file
+    def read_file(filepath, iteration, verbose):
+        """Read a single parquet file and return result."""
+        try:
+            df = cudf.read_parquet(filepath)
+            # Force materialization of data
+            row_count = len(df)
+            if verbose:
+                print(f"  Iteration {iteration}, {os.path.basename(filepath)}: {row_count} rows")
+            return {"success": True, "file": filepath, "rows": row_count}
+        except Exception as e:
+            return {"success": False, "file": filepath, "error": str(e)}
+
     # Run iterations
     failures = []
     start_time = time.time()
@@ -86,35 +112,56 @@ def main():
     for iteration in range(1, args.iterations + 1):
         iteration_start = time.time()
 
-        for f in files:
-            try:
-                df = cudf.read_parquet(f)
-                # Force materialization of data
-                row_count = len(df)
+        # Optionally shuffle files
+        iteration_files = files.copy()
+        if args.shuffle:
+            random.shuffle(iteration_files)
 
-                if args.verbose:
-                    print(f"  Iteration {iteration}, {os.path.basename(f)}: {row_count} rows")
-
-            except Exception as e:
-                elapsed = time.time() - start_time
-                failure_info = {
-                    "iteration": iteration,
-                    "file": f,
-                    "error": str(e),
-                    "elapsed_seconds": elapsed,
+        if args.parallel > 1:
+            # Parallel execution
+            with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+                futures = {
+                    executor.submit(read_file, f, iteration, args.verbose): f
+                    for f in iteration_files
                 }
-                failures.append(failure_info)
+                for future in as_completed(futures):
+                    result = future.result()
+                    if not result["success"]:
+                        elapsed = time.time() - start_time
+                        failure_info = {
+                            "iteration": iteration,
+                            "file": result["file"],
+                            "error": result["error"],
+                            "elapsed_seconds": elapsed,
+                        }
+                        failures.append(failure_info)
 
-                print(f"\n{'='*60}")
-                print(f"FAILURE at iteration {iteration}")
-                print(f"File: {f}")
-                print(f"Error: {e}")
-                print(f"Elapsed time: {elapsed:.2f} seconds")
-                print(f"{'='*60}\n")
+                        print(f"\n{'='*60}")
+                        print(f"FAILURE at iteration {iteration}")
+                        print(f"File: {result['file']}")
+                        print(f"Error: {result['error']}")
+                        print(f"Elapsed time: {elapsed:.2f} seconds")
+                        print(f"{'='*60}\n")
+        else:
+            # Sequential execution
+            for f in iteration_files:
+                result = read_file(f, iteration, args.verbose)
+                if not result["success"]:
+                    elapsed = time.time() - start_time
+                    failure_info = {
+                        "iteration": iteration,
+                        "file": result["file"],
+                        "error": result["error"],
+                        "elapsed_seconds": elapsed,
+                    }
+                    failures.append(failure_info)
 
-                # Continue to see if more failures occur
-                # Remove the next two lines if you want to stop on first failure
-                # sys.exit(1)
+                    print(f"\n{'='*60}")
+                    print(f"FAILURE at iteration {iteration}")
+                    print(f"File: {result['file']}")
+                    print(f"Error: {result['error']}")
+                    print(f"Elapsed time: {elapsed:.2f} seconds")
+                    print(f"{'='*60}\n")
 
         iteration_elapsed = time.time() - iteration_start
         print(f"Iteration {iteration}/{args.iterations} completed in {iteration_elapsed:.2f}s")
