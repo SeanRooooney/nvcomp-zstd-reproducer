@@ -24,8 +24,8 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_pool.hpp>
-#include <rmm/mr/device/cuda_async_memory_resource.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <atomic>
 #include <chrono>
