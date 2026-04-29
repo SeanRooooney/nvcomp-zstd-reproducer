@@ -35,7 +35,7 @@ cmake .. \
     -DCUDF_INCLUDE_DIR="$BUILD_DIR/cudf-src/cpp/include" \
     -DCUDF_LIBRARY="$BUILD_DIR/cudf-build/libcudf.so" \
     -DRMM_INCLUDE_DIR="$BUILD_DIR/rmm-src/cpp/include" \
-    -DCMAKE_CXX_FLAGS="-I$BUILD_DIR/cccl-src/libcudacxx/include -I$BUILD_DIR/cccl-src/thrust -I$BUILD_DIR/cccl-src/cub/cub"
+    -DCMAKE_CXX_FLAGS="-I$BUILD_DIR/cccl-src/libcudacxx/include -I$BUILD_DIR/cccl-src/thrust -I$BUILD_DIR/cccl-src/cub"
 
 make
 
