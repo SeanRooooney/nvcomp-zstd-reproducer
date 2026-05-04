@@ -43,7 +43,6 @@ namespace fs = std::filesystem;
 std::mutex cout_mutex;
 std::atomic<int> failure_count{0};
 std::atomic<int> success_count{0};
-std::atomic<uint64_t> bytes_read_this_iteration{0};
 
 struct FailureInfo {
   int iteration;
@@ -83,8 +82,7 @@ std::size_t pass_read_limit = 17179869184UL;   // 16GB
 // Read a single parquet file using chunked reader (like Velox does)
 void read_parquet_file(const std::string& filepath, int iteration,
                        rmm::cuda_stream_view stream,
-                       rmm::device_async_resource_ref mr,
-                       uint64_t file_size) {
+                       rmm::device_async_resource_ref mr) {
   try {
     // Build parquet reader options
     auto source = cudf::io::source_info(filepath);
@@ -100,7 +98,6 @@ void read_parquet_file(const std::string& filepath, int iteration,
     }
 
     success_count++;
-    bytes_read_this_iteration += file_size;
 
   } catch (const std::exception& e) {
     failure_count++;
@@ -126,9 +123,6 @@ int total_iterations = 0;
 uint64_t total_file_size = 0;
 
 // Synchronization for iteration timing
-std::mutex iteration_mutex;
-std::condition_variable iteration_cv;
-std::atomic<int> threads_ready{0};
 std::atomic<int> threads_done{0};
 int current_iteration = 0;
 std::chrono::steady_clock::time_point iteration_start_time;
@@ -164,7 +158,7 @@ void worker_thread(const std::vector<FileInfo>& files,
 
     // Distribute files across threads
     for (size_t i = thread_id; i < files.size(); i += num_threads) {
-      read_parquet_file(files[i].path, iter, stream, mr, files[i].size);
+      read_parquet_file(files[i].path, iter, stream, mr);
     }
 
     // Mark this thread as done
@@ -177,8 +171,7 @@ void worker_thread(const std::vector<FileInfo>& files,
                             iteration_end_time - iteration_start_time)
                             .count();
       double elapsed_sec = elapsed_ms / 1000.0;
-      double bytes_read = bytes_read_this_iteration.load();
-      double bandwidth_gbps = (bytes_read / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
+      double bandwidth_gbps = (static_cast<double>(total_file_size) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
 
       int completed = ++completed_iterations;
       std::cout << "Iteration " << completed << "/" << total_iterations
