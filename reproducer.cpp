@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -42,6 +43,7 @@ namespace fs = std::filesystem;
 std::mutex cout_mutex;
 std::atomic<int> failure_count{0};
 std::atomic<int> success_count{0};
+std::atomic<uint64_t> bytes_read_this_iteration{0};
 
 struct FailureInfo {
   int iteration;
@@ -81,7 +83,8 @@ std::size_t pass_read_limit = 17179869184UL;   // 16GB
 // Read a single parquet file using chunked reader (like Velox does)
 void read_parquet_file(const std::string& filepath, int iteration,
                        rmm::cuda_stream_view stream,
-                       rmm::device_async_resource_ref mr) {
+                       rmm::device_async_resource_ref mr,
+                       uint64_t file_size) {
   try {
     // Build parquet reader options
     auto source = cudf::io::source_info(filepath);
@@ -97,6 +100,7 @@ void read_parquet_file(const std::string& filepath, int iteration,
     }
 
     success_count++;
+    bytes_read_this_iteration += file_size;
 
   } catch (const std::exception& e) {
     failure_count++;
@@ -119,9 +123,24 @@ std::unique_ptr<rmm::cuda_stream_pool> stream_pool;
 // Track iteration progress
 std::atomic<int> completed_iterations{0};
 int total_iterations = 0;
+uint64_t total_file_size = 0;
+
+// Synchronization for iteration timing
+std::mutex iteration_mutex;
+std::condition_variable iteration_cv;
+std::atomic<int> threads_ready{0};
+std::atomic<int> threads_done{0};
+int current_iteration = 0;
+std::chrono::steady_clock::time_point iteration_start_time;
+
+// File info (path + size)
+struct FileInfo {
+  std::string path;
+  uint64_t size;
+};
 
 // Worker thread function
-void worker_thread(const std::vector<std::string>& files,
+void worker_thread(const std::vector<FileInfo>& files,
                    int iterations,
                    int thread_id,
                    int num_threads,
@@ -130,17 +149,48 @@ void worker_thread(const std::vector<std::string>& files,
   auto stream = stream_pool->get_stream();
 
   for (int iter = 1; iter <= iterations; iter++) {
-    // Distribute files across threads
-    for (size_t i = thread_id; i < files.size(); i += num_threads) {
-      read_parquet_file(files[i], iter, stream, mr);
+    // Thread 0 starts the iteration timing
+    if (thread_id == 0) {
+      bytes_read_this_iteration = 0;
+      iteration_start_time = std::chrono::steady_clock::now();
+      threads_done = 0;
+      current_iteration = iter;
     }
 
-    // Thread 0 reports progress after each iteration
-    if (thread_id == 0) {
+    // Simple barrier - wait for thread 0 to set up
+    while (current_iteration < iter) {
+      std::this_thread::yield();
+    }
+
+    // Distribute files across threads
+    for (size_t i = thread_id; i < files.size(); i += num_threads) {
+      read_parquet_file(files[i].path, iter, stream, mr, files[i].size);
+    }
+
+    // Mark this thread as done
+    int done = ++threads_done;
+
+    // Last thread to finish reports progress
+    if (done == num_threads) {
+      auto iteration_end_time = std::chrono::steady_clock::now();
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            iteration_end_time - iteration_start_time)
+                            .count();
+      double elapsed_sec = elapsed_ms / 1000.0;
+      double bytes_read = bytes_read_this_iteration.load();
+      double bandwidth_gbps = (bytes_read / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
+
       int completed = ++completed_iterations;
       std::cout << "Iteration " << completed << "/" << total_iterations
+                << " | " << std::fixed << std::setprecision(2) << elapsed_sec << "s"
+                << " | " << std::setprecision(2) << bandwidth_gbps << " GB/s"
                 << " (successes: " << success_count.load()
                 << ", failures: " << failure_count.load() << ")\n";
+    }
+
+    // Wait for reporting to complete before next iteration
+    while (threads_done < num_threads) {
+      std::this_thread::yield();
     }
   }
 }
@@ -186,18 +236,23 @@ int main(int argc, char* argv[]) {
 
   // Collect parquet files
   std::cout << "Collecting parquet files from: " << parquet_path << "\n";
-  auto files = collect_parquet_files(parquet_path);
+  auto file_paths = collect_parquet_files(parquet_path);
 
-  if (files.empty()) {
+  if (file_paths.empty()) {
     std::cerr << "ERROR: No parquet files found in " << parquet_path << "\n";
     return 1;
   }
 
-  // Calculate total size
+  // Build file info with sizes
+  std::vector<FileInfo> files;
+  files.reserve(file_paths.size());
   uint64_t total_size = 0;
-  for (const auto& f : files) {
-    total_size += fs::file_size(f);
+  for (const auto& path : file_paths) {
+    uint64_t size = fs::file_size(path);
+    files.push_back({path, size});
+    total_size += size;
   }
+  total_file_size = total_size;
 
   std::cout << "Found " << files.size() << " parquet file(s)\n";
   std::cout << "Total size: " << total_size << " bytes ("
@@ -226,6 +281,10 @@ int main(int argc, char* argv[]) {
                      .count();
 
   // Summary
+  double total_bytes_read = static_cast<double>(total_file_size) * iterations;
+  double total_elapsed_sec = elapsed / 1000.0;
+  double avg_bandwidth_gbps = (total_bytes_read / (1024.0 * 1024.0 * 1024.0)) / total_elapsed_sec;
+
   std::cout << "\n";
   std::cout << "============================================================\n";
   std::cout << "SUMMARY\n";
@@ -236,7 +295,9 @@ int main(int argc, char* argv[]) {
   std::cout << "Total reads attempted: " << (iterations * files.size()) << "\n";
   std::cout << "Successful reads: " << success_count.load() << "\n";
   std::cout << "Failed reads: " << failure_count.load() << "\n";
-  std::cout << "Total time: " << (elapsed / 1000.0) << " seconds\n";
+  std::cout << "Total time: " << std::fixed << std::setprecision(2) << total_elapsed_sec << " seconds\n";
+  std::cout << "Total data read: " << std::setprecision(2) << (total_bytes_read / (1024.0 * 1024.0 * 1024.0)) << " GB\n";
+  std::cout << "Average bandwidth: " << std::setprecision(2) << avg_bandwidth_gbps << " GB/s\n";
 
   if (!failures.empty()) {
     std::cout << "\nFailures:\n";
