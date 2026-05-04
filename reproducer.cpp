@@ -33,6 +33,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,22 +56,22 @@ std::mutex failures_mutex;
 
 // Collect all parquet files recursively
 std::vector<std::string> collect_parquet_files(const std::string& path) {
-  std::vector<std::string> files;
+  std::set<std::string> file_set;  // Use set to deduplicate
 
   if (fs::is_regular_file(path)) {
     if (path.ends_with(".parquet")) {
-      files.push_back(path);
+      file_set.insert(fs::canonical(path).string());
     }
   } else if (fs::is_directory(path)) {
     for (const auto& entry : fs::recursive_directory_iterator(path)) {
       if (entry.is_regular_file() &&
           entry.path().extension() == ".parquet") {
-        files.push_back(entry.path().string());
+        file_set.insert(fs::canonical(entry.path()).string());
       }
     }
   }
 
-  return files;
+  return std::vector<std::string>(file_set.begin(), file_set.end());
 }
 
 // Velox/Prestissimo chunk limits (from environment or defaults)
