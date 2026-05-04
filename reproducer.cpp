@@ -28,6 +28,7 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
@@ -124,9 +125,8 @@ int total_iterations = 0;
 uint64_t total_file_size = 0;
 
 // Synchronization for iteration timing
-std::atomic<int> threads_done{0};
-int current_iteration = 0;
 std::chrono::steady_clock::time_point iteration_start_time;
+std::unique_ptr<std::barrier<>> iteration_barrier;
 
 // File info (path + size)
 struct FileInfo {
@@ -144,28 +144,24 @@ void worker_thread(const std::vector<FileInfo>& files,
   auto stream = stream_pool->get_stream();
 
   for (int iter = 1; iter <= iterations; iter++) {
-    // Thread 0 starts the iteration timing
+    // Thread 0 records start time before barrier
     if (thread_id == 0) {
       iteration_start_time = std::chrono::steady_clock::now();
-      threads_done = 0;
-      current_iteration = iter;
     }
 
-    // Simple barrier - wait for thread 0 to set up
-    while (current_iteration < iter) {
-      std::this_thread::yield();
-    }
+    // All threads sync at start of iteration
+    iteration_barrier->arrive_and_wait();
 
     // Distribute files across threads
     for (size_t i = thread_id; i < files.size(); i += num_threads) {
       read_parquet_file(files[i].path, iter, stream, mr);
     }
 
-    // Mark this thread as done
-    int done = ++threads_done;
+    // All threads sync at end of iteration
+    iteration_barrier->arrive_and_wait();
 
-    // Last thread to finish reports progress
-    if (done == num_threads) {
+    // Thread 0 reports progress after all threads done
+    if (thread_id == 0) {
       auto iteration_end_time = std::chrono::steady_clock::now();
       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             iteration_end_time - iteration_start_time)
@@ -179,11 +175,6 @@ void worker_thread(const std::vector<FileInfo>& files,
                 << " | " << std::setprecision(2) << bandwidth_gbps << " GB/s"
                 << " (successes: " << success_count.load()
                 << ", failures: " << failure_count.load() << ")\n";
-    }
-
-    // Wait for reporting to complete before next iteration
-    while (threads_done < num_threads) {
-      std::this_thread::yield();
     }
   }
 }
@@ -253,6 +244,9 @@ int main(int argc, char* argv[]) {
   std::cout << "Iterations: " << iterations << "\n";
   std::cout << "Parallel threads: " << num_threads << "\n";
   std::cout << "\n";
+
+  // Create barrier for thread synchronization
+  iteration_barrier = std::make_unique<std::barrier<>>(num_threads);
 
   auto start_time = std::chrono::steady_clock::now();
 
