@@ -146,7 +146,6 @@ void worker_thread(const std::vector<FileInfo>& files,
   for (int iter = 1; iter <= iterations; iter++) {
     // Thread 0 starts the iteration timing
     if (thread_id == 0) {
-      bytes_read_this_iteration = 0;
       iteration_start_time = std::chrono::steady_clock::now();
       threads_done = 0;
       current_iteration = iter;
