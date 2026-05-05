@@ -233,12 +233,11 @@ int main(int argc, char* argv[]) {
     std::cerr << "  --iterations N    Number of iterations per thread (default: 100)\n";
     std::cerr << "  --threads N       Number of concurrent threads (default: 5)\n";
     std::cerr << "  --tables N        Alias for --threads\n";
-    std::cerr << "  --gpu N           GPU device ID to use (default: 0)\n";
     std::cerr << "  --chunk-limit N   Chunk read limit in GB (default: 4)\n";
     std::cerr << "  --pass-limit N    Pass read limit in GB (default: 16)\n";
     std::cerr << "\n";
-    std::cerr << "Example:\n";
-    std::cerr << "  " << argv[0] << " /path/to/parquet/files --iterations 50 --threads 5 --gpu 1\n";
+    std::cerr << "To use a specific GPU, set CUDA_VISIBLE_DEVICES:\n";
+    std::cerr << "  CUDA_VISIBLE_DEVICES=2 " << argv[0] << " /path/to/files --iterations 50 --threads 5\n";
     return 1;
   }
 
@@ -246,7 +245,6 @@ int main(int argc, char* argv[]) {
   std::vector<std::string> parquet_paths;
   int iterations = 100;
   int num_threads = 5;
-  int gpu_id = 0;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -254,8 +252,6 @@ int main(int argc, char* argv[]) {
       iterations = std::stoi(argv[++i]);
     } else if ((arg == "--threads" || arg == "--tables") && i + 1 < argc) {
       num_threads = std::stoi(argv[++i]);
-    } else if (arg == "--gpu" && i + 1 < argc) {
-      gpu_id = std::stoi(argv[++i]);
     } else if (arg == "--chunk-limit" && i + 1 < argc) {
       chunk_read_limit = static_cast<std::size_t>(std::stod(argv[++i]) * 1024 * 1024 * 1024);
     } else if (arg == "--pass-limit" && i + 1 < argc) {
@@ -270,30 +266,19 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  // Set GPU device FIRST, before any CUDA operations
-  // Use CUDA_VISIBLE_DEVICES-style behavior: set device before runtime init
-  cudaError_t err = cudaSetDevice(gpu_id);
-  if (err != cudaSuccess) {
-    std::cerr << "ERROR: Failed to set GPU " << gpu_id << ": " << cudaGetErrorString(err) << "\n";
-    int device_count = 0;
-    cudaGetDeviceCount(&device_count);
-    std::cerr << "Available GPUs: 0-" << (device_count - 1) << "\n";
-    return 1;
-  }
-
-  // Verify the device is set correctly
-  int current_device = -1;
+  // Get current GPU device (set via CUDA_VISIBLE_DEVICES)
+  int current_device = 0;
   cudaGetDevice(&current_device);
 
   std::cout << "=== Velox Pattern Reproducer ===\n";
-  std::cout << "GPU device: " << current_device << " (requested: " << gpu_id << ")\n";
+  std::cout << "GPU device: " << current_device << "\n";
   std::cout << "Chunk read limit: " << (chunk_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Pass read limit: " << (pass_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Iterations per thread: " << iterations << "\n";
   std::cout << "Concurrent threads: " << num_threads << "\n";
 
   // Setup async memory resource (like Velox does)
-  std::cout << "\nSetting up CUDA async memory resource on GPU " << gpu_id << "...\n";
+  std::cout << "\nSetting up CUDA async memory resource...\n";
   auto async_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>();
   rmm::mr::set_current_device_resource(async_mr.get());
 
