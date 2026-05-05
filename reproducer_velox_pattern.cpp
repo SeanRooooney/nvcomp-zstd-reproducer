@@ -228,27 +228,28 @@ int main(int argc, char* argv[]) {
     std::cerr << "Simulates Velox's multi-table concurrent scan pattern.\n";
     std::cerr << "\n";
     std::cerr << "Options:\n";
-    std::cerr << "  --iterations N    Number of iterations per table (default: 100)\n";
-    std::cerr << "  --tables N        Number of concurrent table scans (default: 5)\n";
+    std::cerr << "  --iterations N    Number of iterations per thread (default: 100)\n";
+    std::cerr << "  --threads N       Number of concurrent threads (default: 5)\n";
+    std::cerr << "  --tables N        Alias for --threads\n";
     std::cerr << "  --chunk-limit N   Chunk read limit in GB (default: 4)\n";
     std::cerr << "  --pass-limit N    Pass read limit in GB (default: 16)\n";
     std::cerr << "\n";
     std::cerr << "Example:\n";
-    std::cerr << "  " << argv[0] << " /path/to/parquet/files --iterations 50 --tables 5\n";
+    std::cerr << "  " << argv[0] << " /path/to/parquet/files --iterations 50 --threads 5\n";
     return 1;
   }
 
   // Parse arguments
   std::vector<std::string> parquet_paths;
   int iterations = 100;
-  int num_tables = 5;
+  int num_threads = 5;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--iterations" && i + 1 < argc) {
       iterations = std::stoi(argv[++i]);
-    } else if (arg == "--tables" && i + 1 < argc) {
-      num_tables = std::stoi(argv[++i]);
+    } else if ((arg == "--threads" || arg == "--tables") && i + 1 < argc) {
+      num_threads = std::stoi(argv[++i]);
     } else if (arg == "--chunk-limit" && i + 1 < argc) {
       chunk_read_limit = static_cast<std::size_t>(std::stod(argv[++i]) * 1024 * 1024 * 1024);
     } else if (arg == "--pass-limit" && i + 1 < argc) {
@@ -266,8 +267,8 @@ int main(int argc, char* argv[]) {
   std::cout << "=== Velox Pattern Reproducer ===\n";
   std::cout << "Chunk read limit: " << (chunk_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Pass read limit: " << (pass_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
-  std::cout << "Iterations per table: " << iterations << "\n";
-  std::cout << "Concurrent tables: " << num_tables << "\n";
+  std::cout << "Iterations per thread: " << iterations << "\n";
+  std::cout << "Concurrent threads: " << num_threads << "\n";
 
   // Setup async memory resource (like Velox does)
   std::cout << "\nSetting up CUDA async memory resource...\n";
@@ -295,22 +296,22 @@ int main(int argc, char* argv[]) {
   std::mt19937 gen(rd());
   std::shuffle(all_files.begin(), all_files.end(), gen);
 
-  // Distribute files across "tables" (like multiple table scans in a query)
-  std::vector<std::vector<std::string>> table_files(num_tables);
+  // Distribute files across threads
+  std::vector<std::vector<std::string>> thread_files(num_threads);
   for (size_t i = 0; i < all_files.size(); i++) {
-    table_files[i % num_tables].push_back(all_files[i]);
+    thread_files[i % num_threads].push_back(all_files[i]);
   }
 
-  std::cout << "\nFiles per table:\n";
-  for (int i = 0; i < num_tables; i++) {
-    std::cout << "  Table " << i << ": " << table_files[i].size() << " files\n";
+  std::cout << "\nFiles per thread:\n";
+  for (int i = 0; i < num_threads; i++) {
+    std::cout << "  Thread " << i << ": " << thread_files[i].size() << " files\n";
   }
 
-  std::cout << "\n=== Starting concurrent table scans ===\n\n";
+  std::cout << "\n=== Starting concurrent reads ===\n\n";
   auto start_time = std::chrono::steady_clock::now();
 
   // Run the simulation
-  run_query_simulation(table_files, iterations, async_mr.get());
+  run_query_simulation(thread_files, iterations, async_mr.get());
 
   auto end_time = std::chrono::steady_clock::now();
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -326,8 +327,8 @@ int main(int argc, char* argv[]) {
   std::cout << "============================================================\n";
   std::cout << "SUMMARY\n";
   std::cout << "============================================================\n";
-  std::cout << "Concurrent tables: " << num_tables << "\n";
-  std::cout << "Iterations per table: " << iterations << "\n";
+  std::cout << "Concurrent threads: " << num_threads << "\n";
+  std::cout << "Iterations per thread: " << iterations << "\n";
   std::cout << "Total files: " << all_files.size() << "\n";
   std::cout << "Successful reads: " << success_count.load() << "\n";
   std::cout << "Failed reads: " << failure_count.load() << "\n";
