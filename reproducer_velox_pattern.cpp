@@ -170,8 +170,8 @@ public:
                          iter_end - iter_start).count();
       double iter_throughput_mb = (iter_bytes / 1024.0 / 1024.0) / (iter_ms / 1000.0);
 
-      // Report progress every iteration with timing
-      {
+      // Report progress every 10 iterations
+      if (iter % 10 == 0 || iter == 1 || iter == iterations) {
         std::lock_guard<std::mutex> lock(cout_mutex);
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                            iter_end - table_start).count();
