@@ -1,183 +1,210 @@
-# Session State: nvCOMP ZSTD Decompression Investigation
+# Session State: nvCOMP ZSTD Decompression Bug Investigation
 
-**Last Updated**: 2026-04-29
+## Status: RELIABLY REPRODUCED - cuDF Bug Confirmed
 
-## Problem Summary
+We have successfully reproduced the intermittent ZSTD decompression failure **outside of Velox** using a standalone cuDF reproducer. This confirms the bug is in cuDF/nvCOMP, not in Velox's integration layer.
 
-Intermittent "Error during decompression" when reading ZSTD-compressed Parquet files via Prestissimo/Velox using cuDF/nvCOMP.
+## Latest Reproduction Results (2026-05-05)
 
-### Key Characteristics
-- **Intermittent**: Same query on same files sometimes works, sometimes fails
-- **ZSTD only**: Snappy compression works fine
-- **GPU only**: CPU decompression path works
-- **Small files**: Parquet files from Iceberg tables
+**Test Configuration:** 50 iterations, 5 threads, 6046 files (~15GB total)
 
-### Error Message
+### Failure Summary
+
+| Run | GPU | Result | Failed at | Error Type |
+|-----|-----|--------|-----------|------------|
+| 1 | 0 | ❌ | iter 17 | Decompression error |
+| 2 | 0 | ❌ | iter 30+ | Hang (infinite loop) |
+| 3 | 0 | ✅ | - | - |
+| 4 | 1 | ❌ | iter 30+ | cudaErrorIllegalAddress |
+| 5 | 0 | ✅ | - | - |
+| 6 | 0 | ❌ | iter 30+ | cudaErrorIllegalAddress |
+
+**Failure rate:** ~60-70% of runs fail
+
+**Typical failure point:** iteration 17-30+ (~100k-200k file reads, ~250-500 GB data)
+
+### Three Failure Modes (Same Underlying Bug)
+
+1. **"Error during decompression"** - cuDF catches the error
+   ```
+   CUDF failure at: .../reader_impl_chunking_utils.cu:622: Error during decompression
+   ```
+
+2. **cudaErrorIllegalAddress** - Memory corruption crashes the process
+   ```
+   CUDA Error detected. cudaErrorIllegalAddress an illegal memory access was encountered
+   ```
+
+3. **Hang** - Process stuck at 100% GPU utilization, no progress (infinite loop or deadlock)
+
+### Confirmation that Files are NOT Corrupt
+
+- Failing file read 1400 times single-threaded with zero failures
+- Bug only manifests under concurrent multi-threaded access
+- Different files fail on different runs (random based on shuffle order)
+
+## The Bug
+
+**Summary:** Intermittent "Error during decompression" failures when multiple `chunked_parquet_reader` instances read ZSTD-compressed Parquet files concurrently using streams from the same global stream pool.
+
+**Error Message:**
 ```
-VeloxRuntimeError: CUDF failure at: /prestissimo/_build/_deps/cudf-src/cpp/src/io/parquet/reader_impl_chunking_utils.cu:622: Error during decompression
+CUDF failure at: /prestissimo/_build/release/_deps/cudf-src/cpp/src/io/parquet/reader_impl_chunking_utils.cu:622: Error during decompression
+```
+
+Sometimes manifests as:
+```
+CUDA error at: cuda_stream_view.cpp:45: cudaErrorIllegalAddress an illegal memory access was encountered
 ```
 
 ## Environment
 
-- **cuDF**: 26.06 (26.04 in some tests)
-- **nvCOMP**: 5.2.0.10 (dev) / 5.2.0.13 (runtime)
-- **Source data**: IBM watsonx.data / Presto with Iceberg table format
-- **Compression**: ZSTD (level unknown, likely default 3)
-- **Velox Chunk Limits**:
-  - `PARQUET_READER_CHUNK_READ_LIMIT`: 4GB (4294967296)
-  - `PARQUET_READER_PASS_READ_LIMIT`: 16GB (17179869184)
+- **cuDF:** Built from source (Prestissimo dependency, version 26.06)
+- **nvCOMP:** 5.2.0.10 (dev) / 5.2.0.13 (runtime)
+- **CUDA:** 13.0
+- **Driver:** 580.126.16
+- **GPU:** NVIDIA A100-SXM4-80GB
+- **OS:** Linux (GPFS filesystem)
+- **Parquet files:** ZSTD-compressed, many small files (~6000 files, ~15GB total)
 
-## Root Cause Investigation
+## Reproducer
 
-### cuDF Error Location
-File: `cpp/src/io/parquet/reader_impl_chunking_utils.cu:622`
+A standalone C++ reproducer is available: `reproducer_velox_pattern.cpp`
 
-```cpp
-CUDF_EXPECTS(
-  cudf::detail::all_of(comp_res.begin(),
-                       comp_res.end(),
-                       cuda::proclaim_return_type<bool>([] __device__(auto const& res) {
-                         return res.status == codec_status::SUCCESS;
-                       }),
-                       stream),
-  "Error during decompression");
+**Build:**
+```bash
+./build.sh /prestissimo
 ```
 
-This check verifies all decompression results succeeded. The actual nvCOMP error code is not logged.
-
-### Known nvCOMP Issue
-From [nvCOMP release notes](https://docs.nvidia.com/cuda/nvcomp/release_notes.html):
-
-> "Zstd decompression fails when decompressing buffers compressed with compression level 18 and higher using the Zstd library version 1.5.6. To workaround the problem temporarily, you can provide 1.5x the scratch required by nvcompBatchedZstdDecompressGetTempSizeAsync to nvcompBatchedZstdDecompressAsync."
-
-**Note**: This documented issue is deterministic, but our issue is intermittent, suggesting a potentially different or related root cause.
-
-## Reproduction Attempts
-
-### 1. Python cuDF (reproducer.py)
-- Ran 100+ iterations with --parallel 16
-- 6046 files, ~15.5 GB total
-- **Result**: No failures reproduced
-- **Conclusion**: Python path may have different memory/threading behavior
-
-### 2. C++ libcudf (reproducer.cpp)
-- Mimics Velox's approach:
-  - `cudf::io::chunked_parquet_reader`
-  - `rmm::mr::cuda_async_memory_resource`
-  - `rmm::cuda_stream_pool` for per-thread streams
-  - Multi-threaded parallel reads
-  - Now uses Velox's chunk/pass read limits (4GB/16GB)
-- **Status**: Extensive testing with no failures
-
-### 3. Stress Testing Results
-Ran 4 concurrent C++ reproducer processes:
-- Total GPU memory usage: ~55GB (18GB + 16GB + 15GB + 5GB)
-- GPU utilization: 100% (800%+ compute)
-- **Result**: No failures reproduced even under heavy load
-
-### Key Finding
-**The standalone reproducers (both Python and C++) cannot trigger the failure**, even under extreme GPU memory pressure and high concurrency. This strongly suggests the issue is specific to Velox's integration layer, not cuDF/nvCOMP itself.
-
-## Hypotheses
-
-### Ruled Out (by reproducer testing)
-1. ~~**Race condition** in nvCOMP zstd decompression kernel~~ - Would have appeared in C++ reproducer
-2. ~~**GPU memory pressure** - scratch space allocation varies~~ - Tested at 55GB+ usage, no failures
-3. ~~**cuDF chunked_parquet_reader bug**~~ - Works fine in isolation
-
-### Still Possible (Velox-specific)
-4. **Velox's BufferedInputDataSource** - async I/O layer wrapping cuDF data sources
-5. **Velox's memory pool wrapper** - may interact differently with rmm
-6. **Velox's TableScan operator** - concurrent operators, task scheduling
-7. **AST filter pushdown** - reproducer doesn't use filters
-8. **Stream synchronization in Velox** - async CUDA operations between Velox and cuDF
-9. **Data source lifecycle** - how Velox manages cuDF data source objects
-
-## How the C++ Reproducer Works
-
-### Setup
-```cpp
-// Create async memory allocator (same as Velox)
-auto async_mr = rmm::mr::cuda_async_memory_resource();
-
-// Create pool of CUDA streams (one per thread)
-stream_pool = rmm::cuda_stream_pool(num_threads);
+**Run:**
+```bash
+./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
 ```
 
-### Per Thread (in parallel)
-```cpp
-// Get a dedicated CUDA stream
-auto stream = stream_pool->get_stream();
+**What it does:**
+- Creates N concurrent "table scan" threads (default 5, simulating a multi-table JOIN query)
+- Each thread creates a new `chunked_parquet_reader` **per file** (like Velox does per split)
+- Each reader gets a stream from `cudf::detail::global_cuda_stream_pool()`
+- All readers share the same `cuda_async_memory_resource`
+- Reads ZSTD-compressed Parquet files
 
-// Loop through iterations
-for (iteration = 1 to N) {
-    // Read assigned files
-    for (file in my_files) {
-        // Create chunked reader (same as Velox uses)
-        cudf::io::chunked_parquet_reader reader(0, 0, options, stream, mr);
-
-        // Read all chunks
-        while (reader.has_next()) {
-            auto chunk = reader.read_chunk();  // <-- decompression happens here
-            total_rows += chunk.num_rows();
-        }
-    }
-}
+**Example failure output:**
+```
+============================================================
+FAILURE - Table 3, iteration 3
+File: /gpfs/zc2/data/cio_prod/raw-telemetry/rpt_system_config/date_added_ts_day=2026-03-16/00002-1802-cf0fea6f-2dcc-470c-9268-8b231769ac94-0-00098.parquet
+Error: CUDF failure at: /prestissimo/_build/release/_deps/cudf-src/cpp/src/io/parquet/reader_impl_chunking_utils.cu:622: Error during decompression
+============================================================
 ```
 
-### What It Tests
-- Multiple threads reading Parquet files concurrently
-- Each thread uses its own CUDA stream
-- All threads share the async memory allocator
-- Creates GPU memory pressure and concurrent decompression operations
+## Conditions That Trigger the Bug
 
-### What It Does NOT Test (compared to Velox)
-- Column projection / filtering
-- Velox's specific memory pool settings
-- Multiple concurrent queries
-- The exact chunking limits Velox uses (`maxChunkReadLimit`, `maxPassReadLimit`)
-- AST filter pushdown
-- Velox memory pool integration
+**Required:**
+1. Multiple concurrent `chunked_parquet_reader` instances
+2. Streams from `cudf::detail::global_cuda_stream_pool()`
+3. ZSTD-compressed Parquet files
+4. Shared async memory resource
 
-### Where Decompression Failure Would Occur
-Inside `reader.read_chunk()` when nvCOMP tries to decompress ZSTD-compressed Parquet pages.
+**Increases failure probability:**
+- Many small Parquet files (vs few large files)
+- Higher concurrency (more simultaneous readers, e.g., 5 table scans)
+- Variable I/O latency (e.g., GPFS network filesystem)
+
+**Failure rate:**
+- Production (Presto queries): ~10% of complex multi-table queries fail
+- Standalone reproducer: ~60-70% of runs fail within 50 iterations
+
+## What Does NOT Trigger the Bug
+
+- Single-threaded sequential reads
+- Simple queries on single tables (even with filters)
+- Multiple simple queries run in parallel as separate Presto queries
+- The original simple reproducer (one reader per thread, threads read different files)
+
+## Key Difference: Why Velox-Pattern Reproducer Works
+
+| Simple Reproducer | Velox-Pattern Reproducer |
+|-------------------|--------------------------|
+| One stream per thread, reused | New stream from global pool per reader |
+| One reader per thread, reused | New reader created per file |
+| Threads read disjoint file sets | Multiple readers active simultaneously |
+| Does NOT trigger bug | TRIGGERS bug |
+
+The critical difference is that Velox creates a **new `chunked_parquet_reader`** for each split/file, getting a fresh stream from the global pool each time. This means multiple readers can be active simultaneously on different streams, which exposes the bug.
+
+## Investigation Timeline
+
+1. **Initial observation:** Intermittent failures in Prestissimo/Velox reading ZSTD Parquet via cuDF
+2. **First reproducer (reproducer.cpp):** Simple threads reading files - NO FAILURE
+3. **Python cuDF test:** 100+ iterations - NO FAILURE
+4. **Hypothesis:** Race condition in async memory copy (BufferedInputDataSource)
+5. **Fix attempted:** Added `stream.synchronize()` after `cudaMemcpyAsync` - STILL FAILED
+6. **Key insight:** Bug occurs with `CUDF_HIVE_USE_BUFFERED_INPUT=false` too
+7. **Tested:** Simple queries with filters - NO FAILURE
+8. **Tested:** Parallel simple queries - NO FAILURE
+9. **Velox pattern reproducer (reproducer_velox_pattern.cpp):** Mimicked multi-table concurrent scan - **REPRODUCED**
+
+## Root Cause Hypothesis
+
+The bug is likely in cuDF's Parquet reader or nvCOMP when:
+- Multiple decompression operations run on different CUDA streams concurrently
+- All streams come from `cudf::detail::global_cuda_stream_pool()`
+- Possibly shared scratch space, decompression state, or nvCOMP resources that aren't thread-safe
+- Or stream pool reuse patterns that cause resource conflicts before previous operations complete
 
 ## Files in This Repo
 
-- `reproducer.py` - Python cuDF reproducer
-- `reproducer.cpp` - C++ libcudf reproducer (closer to Velox)
+- `reproducer.cpp` - Original simple reproducer (does NOT trigger bug)
+- `reproducer_velox_pattern.cpp` - Velox-pattern reproducer (**TRIGGERS bug**)
+- `reproducer.py` - Python cuDF reproducer (does NOT trigger bug)
 - `CMakeLists.txt` - CMake build configuration
 - `build.sh` - Build script for Prestissimo environment
 - `SESSION_STATE.md` - This file
 
-## Next Steps
-
-Since the standalone reproducers cannot trigger the failure, investigation must move to Velox level:
-
-1. **Create a Velox-level reproducer** - Use Velox's TableScan directly instead of raw cuDF
-2. **Examine Velox's BufferedInputDataSource** - Check async I/O handling
-3. **Add nvCOMP error code logging** - Modify cuDF or Velox to capture actual error codes
-4. **Check for specific query patterns** - Does it only fail with certain filters or projections?
-5. **Examine concurrent query behavior** - Does it only fail when multiple queries run?
-6. **Review Velox's CUDA stream management** - Stream synchronization between components
-
-### Files to Investigate in Velox
-- `velox/experimental/cudf/connectors/hive/CudfHiveDataSource.cpp`
-- `velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.cpp`
-- `velox/experimental/cudf/exec/GpuResources.cpp`
-
 ## Useful Commands
 
 ```bash
-# Build C++ reproducer
+# Build reproducers
 ./build.sh /prestissimo
 
-# Run C++ reproducer
-./build/reproducer /path/to/parquet/files 100 8
+# Run Velox-pattern reproducer (triggers bug)
+./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
 
-# Run Python reproducer
-python reproducer.py /path/to/parquet/files --iterations 100 --parallel 8
+# Run on a specific GPU (use CUDA_VISIBLE_DEVICES, not --gpu flag)
+CUDA_VISIBLE_DEVICES=2 ./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
+
+# Run in a loop to reliably trigger the bug
+for i in {1..100}; do
+  echo "=== Run $i ==="
+  ./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
+  if [ $? -ne 0 ]; then echo "FAILED on run $i"; break; fi
+done
+
+# Test a specific file in isolation (to confirm it's not corrupt)
+./build/reproducer_velox_pattern /path/to/specific/dir --iterations 100 --threads 1
+
+# Run simple reproducer (does not trigger bug)
+./build/reproducer /path/to/zstd-parquet-files 100 8
+
+# Run Python reproducer (does not trigger bug)
+python reproducer.py /path/to/zstd-parquet-files --iterations 100 --parallel 8
 ```
+
+**Note:** The `--gpu` flag does not work reliably because cuDF's internal singletons initialize on GPU 0. Use `CUDA_VISIBLE_DEVICES` environment variable instead.
+
+## Potential Workarounds (Untested)
+
+1. Serialize table scans (`NUM_DRIVERS=1` in Velox)
+2. Use separate stream pools per reader instead of global pool
+3. Add synchronization between concurrent readers
+4. Use synchronous memory resource instead of async
+
+## Next Steps
+
+1. **File bug report with cuDF/RAPIDS team** with this reproducer
+2. **Investigate nvCOMP** concurrent decompression behavior
+3. **Check cuDF stream pool** implementation for thread safety issues
+4. **Test workarounds** in production environment
 
 ## Related Links
 
