@@ -270,17 +270,23 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  // Set GPU device
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (gpu_id >= device_count) {
-    std::cerr << "ERROR: GPU " << gpu_id << " not found. Available GPUs: 0-" << (device_count - 1) << "\n";
+  // Set GPU device FIRST, before any CUDA operations
+  // Use CUDA_VISIBLE_DEVICES-style behavior: set device before runtime init
+  cudaError_t err = cudaSetDevice(gpu_id);
+  if (err != cudaSuccess) {
+    std::cerr << "ERROR: Failed to set GPU " << gpu_id << ": " << cudaGetErrorString(err) << "\n";
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    std::cerr << "Available GPUs: 0-" << (device_count - 1) << "\n";
     return 1;
   }
-  cudaSetDevice(gpu_id);
+
+  // Verify the device is set correctly
+  int current_device = -1;
+  cudaGetDevice(&current_device);
 
   std::cout << "=== Velox Pattern Reproducer ===\n";
-  std::cout << "GPU device: " << gpu_id << "\n";
+  std::cout << "GPU device: " << current_device << " (requested: " << gpu_id << ")\n";
   std::cout << "Chunk read limit: " << (chunk_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Pass read limit: " << (pass_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Iterations per thread: " << iterations << "\n";
