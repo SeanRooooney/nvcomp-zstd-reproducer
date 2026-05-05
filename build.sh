@@ -42,4 +42,4 @@ make
 
 echo ""
 echo "Build complete. Run with:"
-echo "  ./build/reproducer /path/to/parquet/files [iterations] [parallel_threads]"
+echo "  ./build/reproducer /path/to/parquet/files --iterations 50 --threads 5"

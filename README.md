@@ -1,151 +1,72 @@
-# nvCOMP ZSTD Decompression Reproducer
+# nvCOMP/cuDF ZSTD Decompression Bug Reproducer
 
-Reproducer for intermittent ZSTD decompression failures when reading small Parquet files via cuDF/nvCOMP.
+Standalone reproducer for intermittent ZSTD decompression failures in cuDF when multiple `chunked_parquet_reader` instances read concurrently.
 
-## Problem Description
+## Bug Summary
 
-- **Symptom**: Intermittent "Error during decompression" when reading ZSTD-compressed Parquet files
-- **Environment**: cuDF 26.06, nvCOMP 5.2.0
-- **Conditions**:
-  - Small Parquet files
-  - ZSTD compression (Snappy works fine)
-  - GPU path only (CPU decompression works)
-  - Non-deterministic (same files sometimes work, sometimes fail)
+**Symptom:** Intermittent failures when reading ZSTD-compressed Parquet files concurrently via cuDF.
 
-## Error Message
+**Three failure modes (same underlying bug):**
+1. `CUDF failure at: .../reader_impl_chunking_utils.cu:622: Error during decompression`
+2. `cudaErrorIllegalAddress: an illegal memory access was encountered`
+3. Process hangs at 100% GPU utilization (infinite loop/deadlock)
 
-```
-CUDF failure at: cpp/src/io/parquet/reader_impl_chunking_utils.cu:622: Error during decompression
-```
+**Failure rate:** ~60-70% of runs fail within 50 iterations (5 threads, 6000 files)
 
-## Related nvCOMP Known Issue
+**Key finding:** Individual files are NOT corrupt - the same file reads successfully 1000+ times single-threaded. Bug only manifests under concurrent multi-threaded access.
 
-From [nvCOMP release notes](https://docs.nvidia.com/cuda/nvcomp/release_notes.html):
+## Environment
 
-> "Zstd decompression fails when decompressing buffers compressed with compression level 18 and higher using the Zstd library version 1.5.6. To workaround the problem temporarily, you can provide 1.5x the scratch required by nvcompBatchedZstdDecompressGetTempSizeAsync to nvcompBatchedZstdDecompressAsync."
+- cuDF 26.06 (built from source)
+- nvCOMP 5.2.0
+- CUDA 13.0
+- NVIDIA A100-SXM4-80GB
 
-Note: The documented issue is deterministic, but our observed behavior is intermittent, suggesting a potentially different (or related) root cause.
+## Building
 
-## Reproducers
-
-Two reproducers are provided:
-
-1. **Python** (`reproducer.py`) - Uses cuDF Python bindings
-2. **C++** (`reproducer.cpp`) - Uses libcudf directly, closer to Velox/Prestissimo
-
-The C++ reproducer mimics how Velox reads Parquet files:
-- Uses `cudf::io::chunked_parquet_reader`
-- Uses `rmm::mr::cuda_async_memory_resource` (async memory)
-- Uses streams from `cudf::detail::global_cuda_stream_pool()`
-- Multi-threaded parallel reads
-
-## Setup
-
-### Python Setup
-
-#### Option 1: Conda (recommended)
+Requires a Prestissimo build with cuDF:
 
 ```bash
-conda create -n cudf_test python=3.11
-conda activate cudf_test
-conda install -c rapidsai -c conda-forge -c nvidia cudf=26.06 python=3.11 cuda-version=12.0
-```
-
-#### Option 2: pip
-
-```bash
-pip install cudf-cu12 --extra-index-url=https://pypi.nvidia.com
-```
-
-### C++ Setup
-
-Requires cuDF and RMM libraries installed. Build with CMake:
-
-```bash
-mkdir build && cd build
-cmake .. -DCUDF_INCLUDE_DIR=/path/to/cudf/include \
-         -DCUDF_LIBRARY=/path/to/cudf/lib/libcudf.so \
-         -DRMM_INCLUDE_DIR=/path/to/rmm/include
-make
-```
-
-Or if cudf/rmm are installed system-wide or via conda:
-
-```bash
-mkdir build && cd build
-cmake ..
-make
+./build.sh /path/to/prestissimo
 ```
 
 ## Usage
 
-### Python
-
-```bash
-# Basic usage - run 100 iterations on all parquet files in a directory
-python reproducer.py /path/to/parquet/files
-
-# Specify number of iterations
-python reproducer.py /path/to/parquet/files --iterations 500
-
-# Parallel reads (stress GPU)
-python reproducer.py /path/to/parquet/files --iterations 100 --parallel 8
-
-# Verbose output (show each file read)
-python reproducer.py /path/to/parquet/files --verbose
-
-# Single file
-python reproducer.py /path/to/file.parquet --iterations 1000
-```
-
-### C++
-
 ```bash
 # Basic usage
-./reproducer /path/to/parquet/files
+./build/reproducer /path/to/zstd-parquet-files --iterations 50 --threads 5
 
-# Specify iterations and threads
-./reproducer /path/to/parquet/files 100 8
+# Run on a specific GPU
+CUDA_VISIBLE_DEVICES=2 ./build/reproducer /path/to/files --iterations 50 --threads 5
+
+# Run in a loop to reliably trigger the bug
+for i in {1..100}; do
+  echo "=== Run $i ==="
+  ./build/reproducer /path/to/files --iterations 50 --threads 5
+  if [ $? -ne 0 ]; then echo "FAILED on run $i"; break; fi
+done
 ```
 
-## Expected Output
+## What the Reproducer Does
 
-### Success
-```
-cuDF version: 26.06.xx
-Found 10 Parquet file(s)
-Total size: 1,234,567 bytes (1.18 MB)
+Mimics how Velox reads multiple tables concurrently:
+- Creates N concurrent threads (simulating multi-table JOINs)
+- Each thread creates a new `chunked_parquet_reader` per file
+- Each reader gets a stream from `cudf::detail::global_cuda_stream_pool()`
+- All readers share the same `cuda_async_memory_resource`
 
-Iteration 1/100 completed in 0.15s
-Iteration 2/100 completed in 0.12s
-...
-============================================================
-SUMMARY
-============================================================
-Total iterations: 100
-Total files per iteration: 10
-Total reads attempted: 1000
-Total failures: 0
-Total time: 12.34 seconds
+## Conditions That Trigger the Bug
 
-All iterations passed successfully
-```
+**Required:**
+1. Multiple concurrent `chunked_parquet_reader` instances
+2. Streams from `cudf::detail::global_cuda_stream_pool()`
+3. ZSTD-compressed Parquet files
+4. Shared async memory resource
 
-### Failure
-```
-============================================================
-FAILURE at iteration 42
-File: /path/to/some_file.parquet
-Error: CUDF failure at: cpp/src/io/parquet/reader_impl_chunking_utils.cu:622: Error during decompression
-Elapsed time: 5.23 seconds
-============================================================
-```
+**What does NOT trigger the bug:**
+- Single-threaded sequential reads
+- Reading the same files with one reader at a time
 
-## Collecting Debug Information
+## See Also
 
-If you reproduce the failure, please collect:
-
-1. cuDF version: `python -c "import cudf; print(cudf.__version__)"`
-2. GPU info: `nvidia-smi`
-3. File that failed (if shareable)
-4. Parquet metadata: `python -c "import pyarrow.parquet as pq; print(pq.read_metadata('failing_file.parquet'))"`
+- `SESSION_STATE.md` - Detailed investigation notes and test results

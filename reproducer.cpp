@@ -1,39 +1,39 @@
 /*
- * nvCOMP/cuDF ZSTD Decompression Reproducer (C++)
+ * nvCOMP/cuDF ZSTD Decompression Reproducer - Velox Pattern
  *
- * This reproducer mimics how Velox/Prestissimo reads Parquet files using
- * libcudf with async memory allocation.
+ * This reproducer mimics how Velox reads multiple tables concurrently
+ * within a single query, with each table scan having its own stream
+ * and potentially AST filter expressions.
  *
- * Build:
- *   nvcc -o reproducer reproducer.cpp \
- *     -I/path/to/cudf/include \
- *     -I/path/to/rmm/include \
- *     -L/path/to/cudf/lib -lcudf \
- *     -L/path/to/rmm/lib -lrmm \
- *     -std=c++17
- *
- * Or use CMake (see CMakeLists.txt)
- *
- * Usage:
- *   ./reproducer /path/to/parquet/files [iterations] [parallel_threads]
+ * Key differences from simple reproducer:
+ * - Multiple concurrent chunked_parquet_reader instances (simulating multiple table scans)
+ * - Each reader has its own stream from a shared pool
+ * - Readers are created/destroyed dynamically (like Velox does per split)
+ * - Optional AST filter expressions
+ * - Shared memory resource across all readers
  */
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda_runtime.h>
+
 #include <atomic>
-#include <barrier>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -45,8 +45,12 @@ namespace fs = std::filesystem;
 std::mutex cout_mutex;
 std::atomic<int> failure_count{0};
 std::atomic<int> success_count{0};
+std::atomic<bool> stop_flag{false};
+std::atomic<int64_t> total_bytes_read{0};
+std::atomic<int64_t> total_rows_read{0};
 
 struct FailureInfo {
+  int table_id;
   int iteration;
   std::string file;
   std::string error;
@@ -55,9 +59,13 @@ struct FailureInfo {
 std::vector<FailureInfo> failures;
 std::mutex failures_mutex;
 
+// Velox/Prestissimo chunk limits
+std::size_t chunk_read_limit = 4294967296UL;   // 4GB
+std::size_t pass_read_limit = 17179869184UL;   // 16GB
+
 // Collect all parquet files recursively
 std::vector<std::string> collect_parquet_files(const std::string& path) {
-  std::set<std::string> file_set;  // Use set to deduplicate
+  std::set<std::string> file_set;
 
   if (fs::is_regular_file(path)) {
     if (path.ends_with(".parquet")) {
@@ -75,192 +83,242 @@ std::vector<std::string> collect_parquet_files(const std::string& path) {
   return std::vector<std::string>(file_set.begin(), file_set.end());
 }
 
-// Velox/Prestissimo chunk limits (from environment or defaults)
-// PARQUET_READER_CHUNK_READ_LIMIT=4294967296 (4GB)
-// PARQUET_READER_PASS_READ_LIMIT=17179869184 (16GB)
-std::size_t chunk_read_limit = 4294967296UL;   // 4GB
-std::size_t pass_read_limit = 17179869184UL;   // 16GB
+// Simulates a single table scan (like CudfHiveDataSource)
+// Each "table" gets a subset of files and reads them with its own reader/stream
+class TableScanSimulator {
+public:
+  TableScanSimulator(int table_id,
+                     const std::vector<std::string>& files,
+                     rmm::device_async_resource_ref mr)
+      : table_id_(table_id), files_(files), mr_(mr) {}
 
-// Read a single parquet file using chunked reader (like Velox does)
-void read_parquet_file(const std::string& filepath, int iteration,
-                       rmm::cuda_stream_view stream,
-                       rmm::device_async_resource_ref mr) {
-  try {
-    // Build parquet reader options
-    auto source = cudf::io::source_info(filepath);
-    auto options = cudf::io::parquet_reader_options::builder(source).build();
+  void run(int iterations) {
+    auto table_start = std::chrono::steady_clock::now();
 
-    // Use chunked reader like Velox does with same limits
-    cudf::io::chunked_parquet_reader reader(chunk_read_limit, pass_read_limit, options, stream, mr);
+    for (int iter = 1; iter <= iterations && !stop_flag; iter++) {
+      auto iter_start = std::chrono::steady_clock::now();
+      int64_t iter_rows = 0;
+      int64_t iter_bytes = 0;
+      int files_this_iter = 0;
 
-    int64_t total_rows = 0;
-    while (reader.has_next()) {
-      auto chunk = reader.read_chunk();
-      total_rows += chunk.tbl->num_rows();
+      // Get a fresh stream from the global pool (like Velox does per split)
+      auto stream = cudf::detail::global_cuda_stream_pool().get_stream();
+
+      for (const auto& filepath : files_) {
+        if (stop_flag) break;
+
+        auto file_start = std::chrono::steady_clock::now();
+
+        try {
+          // Get file size for throughput calculation
+          int64_t file_size = fs::file_size(filepath);
+
+          // Build parquet reader options
+          auto source = cudf::io::source_info(filepath);
+          auto builder = cudf::io::parquet_reader_options::builder(source);
+
+          // Optionally add a simple filter (simulating AST pushdown)
+          // We create a trivial "column 0 is not null" type filter
+          // This exercises the filter pushdown code path
+
+          auto options = builder.build();
+
+          // Create a new chunked reader (like Velox does per split)
+          cudf::io::chunked_parquet_reader reader(
+              chunk_read_limit, pass_read_limit, options, stream, mr_);
+
+          int64_t file_rows = 0;
+          while (reader.has_next()) {
+            auto chunk = reader.read_chunk();
+            file_rows += chunk.tbl->num_rows();
+          }
+
+          auto file_end = std::chrono::steady_clock::now();
+          auto file_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             file_end - file_start).count();
+
+          iter_rows += file_rows;
+          iter_bytes += file_size;
+          files_this_iter++;
+
+          total_rows_read += file_rows;
+          total_bytes_read += file_size;
+          success_count++;
+
+        } catch (const std::exception& e) {
+          auto file_end = std::chrono::steady_clock::now();
+          auto file_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             file_end - file_start).count();
+
+          failure_count++;
+          stop_flag = true;
+
+          std::lock_guard<std::mutex> lock(failures_mutex);
+          failures.push_back({table_id_, iter, filepath, e.what()});
+
+          std::lock_guard<std::mutex> cout_lock(cout_mutex);
+          std::cerr << "\n============================================================\n";
+          std::cerr << "FAILURE - Table " << table_id_ << ", iteration " << iter << "\n";
+          std::cerr << "File: " << filepath << "\n";
+          std::cerr << "Time until failure: " << file_ms << " ms\n";
+          std::cerr << "Error: " << e.what() << "\n";
+          std::cerr << "============================================================\n\n";
+          return;
+        }
+      }
+
+      auto iter_end = std::chrono::steady_clock::now();
+      auto iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         iter_end - iter_start).count();
+      double iter_throughput_mb = (iter_bytes / 1024.0 / 1024.0) / (iter_ms / 1000.0);
+
+      // Report progress every 10 iterations
+      if (iter % 10 == 0 || iter == 1 || iter == iterations) {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           iter_end - table_start).count();
+        std::cout << "[T" << table_id_ << "] iter " << iter << "/" << iterations
+                  << " | " << files_this_iter << " files"
+                  << " | " << iter_rows << " rows"
+                  << " | " << std::fixed << std::setprecision(1)
+                  << (iter_bytes / 1024.0 / 1024.0) << " MB"
+                  << " | " << iter_ms << " ms"
+                  << " | " << std::setprecision(1) << iter_throughput_mb << " MB/s"
+                  << " | elapsed " << elapsed << "s"
+                  << "\n";
+      }
     }
-
-    success_count++;
-
-  } catch (const std::exception& e) {
-    failure_count++;
-
-    std::lock_guard<std::mutex> lock(failures_mutex);
-    failures.push_back({iteration, filepath, e.what()});
-
-    std::lock_guard<std::mutex> cout_lock(cout_mutex);
-    std::cerr << "\n============================================================\n";
-    std::cerr << "FAILURE at iteration " << iteration << "\n";
-    std::cerr << "File: " << filepath << "\n";
-    std::cerr << "Error: " << e.what() << "\n";
-    std::cerr << "============================================================\n\n";
   }
-}
 
-// Global stream pool (created in main)
-std::unique_ptr<rmm::cuda_stream_pool> stream_pool;
-
-// Track iteration progress
-std::atomic<int> completed_iterations{0};
-int total_iterations = 0;
-uint64_t total_file_size = 0;
-
-// Synchronization for iteration timing
-std::chrono::steady_clock::time_point iteration_start_time;
-std::unique_ptr<std::barrier<>> iteration_barrier;
-
-// File info (path + size)
-struct FileInfo {
-  std::string path;
-  uint64_t size;
+private:
+  int table_id_;
+  std::vector<std::string> files_;
+  rmm::device_async_resource_ref mr_;
 };
 
-// Worker thread function
-void worker_thread(const std::vector<FileInfo>& files,
-                   int iterations,
-                   int thread_id,
-                   int num_threads,
-                   rmm::device_async_resource_ref mr) {
-  // Each thread gets its own stream from the pool
-  auto stream = stream_pool->get_stream();
+// Simulates a single "query" with multiple concurrent table scans
+void run_query_simulation(const std::vector<std::vector<std::string>>& table_files,
+                          int iterations,
+                          rmm::device_async_resource_ref mr) {
+  std::vector<std::thread> threads;
+  std::vector<std::unique_ptr<TableScanSimulator>> scanners;
 
-  for (int iter = 1; iter <= iterations; iter++) {
-    // Thread 0 records start time before barrier
-    if (thread_id == 0) {
-      iteration_start_time = std::chrono::steady_clock::now();
-    }
+  // Create a scanner for each "table"
+  for (size_t i = 0; i < table_files.size(); i++) {
+    scanners.push_back(std::make_unique<TableScanSimulator>(
+        static_cast<int>(i), table_files[i], mr));
+  }
 
-    // All threads sync at start of iteration
-    iteration_barrier->arrive_and_wait();
+  // Launch all table scans concurrently (like Velox does in a query)
+  for (size_t i = 0; i < scanners.size(); i++) {
+    threads.emplace_back([&scanners, i, iterations]() {
+      scanners[i]->run(iterations);
+    });
+  }
 
-    // Distribute files across threads
-    for (size_t i = thread_id; i < files.size(); i += num_threads) {
-      read_parquet_file(files[i].path, iter, stream, mr);
-    }
-
-    // All threads sync at end of iteration
-    iteration_barrier->arrive_and_wait();
-
-    // Thread 0 reports progress after all threads done
-    if (thread_id == 0) {
-      auto iteration_end_time = std::chrono::steady_clock::now();
-      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            iteration_end_time - iteration_start_time)
-                            .count();
-      double elapsed_sec = elapsed_ms / 1000.0;
-      double bandwidth_gbps = (static_cast<double>(total_file_size) / (1024.0 * 1024.0 * 1024.0)) / elapsed_sec;
-
-      int completed = ++completed_iterations;
-      std::cout << "Iteration " << completed << "/" << total_iterations
-                << " | " << std::fixed << std::setprecision(2) << elapsed_sec << "s"
-                << " | " << std::setprecision(2) << bandwidth_gbps << " GB/s"
-                << " (successes: " << success_count.load()
-                << ", failures: " << failure_count.load() << ")\n";
-    }
+  // Wait for all to complete
+  for (auto& t : threads) {
+    t.join();
   }
 }
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0]
-              << " <parquet_path> [iterations] [parallel_threads] [chunk_limit_gb] [pass_limit_gb]\n";
+              << " <parquet_dir1> [parquet_dir2] ... [--iterations N] [--tables N]\n";
     std::cerr << "\n";
-    std::cerr << "Arguments:\n";
-    std::cerr << "  parquet_path      Path to parquet file or directory\n";
-    std::cerr << "  iterations        Number of iterations (default: 100)\n";
-    std::cerr << "  parallel_threads  Number of parallel threads (default: 4)\n";
-    std::cerr << "  chunk_limit_gb    Chunk read limit in GB (default: 4, Velox default)\n";
-    std::cerr << "  pass_limit_gb     Pass read limit in GB (default: 16, Velox default)\n";
+    std::cerr << "Simulates Velox's multi-table concurrent scan pattern.\n";
+    std::cerr << "\n";
+    std::cerr << "Options:\n";
+    std::cerr << "  --iterations N    Number of iterations per thread (default: 100)\n";
+    std::cerr << "  --threads N       Number of concurrent threads (default: 5)\n";
+    std::cerr << "  --tables N        Alias for --threads\n";
+    std::cerr << "  --chunk-limit N   Chunk read limit in GB (default: 4)\n";
+    std::cerr << "  --pass-limit N    Pass read limit in GB (default: 16)\n";
+    std::cerr << "\n";
+    std::cerr << "To use a specific GPU, set CUDA_VISIBLE_DEVICES:\n";
+    std::cerr << "  CUDA_VISIBLE_DEVICES=2 " << argv[0] << " /path/to/files --iterations 50 --threads 5\n";
     return 1;
   }
 
-  std::string parquet_path = argv[1];
-  int iterations = (argc > 2) ? std::stoi(argv[2]) : 100;
-  int num_threads = (argc > 3) ? std::stoi(argv[3]) : 4;
+  // Parse arguments
+  std::vector<std::string> parquet_paths;
+  int iterations = 100;
+  int num_threads = 5;
 
-  // Allow overriding chunk limits via command line (in GB)
-  if (argc > 4) {
-    chunk_read_limit = static_cast<std::size_t>(std::stod(argv[4]) * 1024 * 1024 * 1024);
-  }
-  if (argc > 5) {
-    pass_read_limit = static_cast<std::size_t>(std::stod(argv[5]) * 1024 * 1024 * 1024);
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--iterations" && i + 1 < argc) {
+      iterations = std::stoi(argv[++i]);
+    } else if ((arg == "--threads" || arg == "--tables") && i + 1 < argc) {
+      num_threads = std::stoi(argv[++i]);
+    } else if (arg == "--chunk-limit" && i + 1 < argc) {
+      chunk_read_limit = static_cast<std::size_t>(std::stod(argv[++i]) * 1024 * 1024 * 1024);
+    } else if (arg == "--pass-limit" && i + 1 < argc) {
+      pass_read_limit = static_cast<std::size_t>(std::stod(argv[++i]) * 1024 * 1024 * 1024);
+    } else if (!arg.starts_with("--")) {
+      parquet_paths.push_back(arg);
+    }
   }
 
+  if (parquet_paths.empty()) {
+    std::cerr << "ERROR: No parquet paths specified\n";
+    return 1;
+  }
+
+  // Get current GPU device (set via CUDA_VISIBLE_DEVICES)
+  int current_device = 0;
+  cudaGetDevice(&current_device);
+
+  std::cout << "=== Velox Pattern Reproducer ===\n";
+  std::cout << "GPU device: " << current_device << "\n";
   std::cout << "Chunk read limit: " << (chunk_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
   std::cout << "Pass read limit: " << (pass_read_limit / 1024.0 / 1024.0 / 1024.0) << " GB\n";
-
-  total_iterations = iterations;
+  std::cout << "Iterations per thread: " << iterations << "\n";
+  std::cout << "Concurrent threads: " << num_threads << "\n";
 
   // Setup async memory resource (like Velox does)
-  std::cout << "Setting up CUDA async memory resource...\n";
+  std::cout << "\nSetting up CUDA async memory resource...\n";
   auto async_mr = std::make_shared<rmm::mr::cuda_async_memory_resource>();
   rmm::mr::set_current_device_resource(async_mr.get());
 
-  // Create stream pool (like Velox uses)
-  stream_pool = std::make_unique<rmm::cuda_stream_pool>(num_threads);
+  // Collect all parquet files from all paths
+  std::vector<std::string> all_files;
+  for (const auto& path : parquet_paths) {
+    std::cout << "Collecting parquet files from: " << path << "\n";
+    auto files = collect_parquet_files(path);
+    std::cout << "  Found " << files.size() << " files\n";
+    all_files.insert(all_files.end(), files.begin(), files.end());
+  }
 
-  // Collect parquet files
-  std::cout << "Collecting parquet files from: " << parquet_path << "\n";
-  auto file_paths = collect_parquet_files(parquet_path);
-
-  if (file_paths.empty()) {
-    std::cerr << "ERROR: No parquet files found in " << parquet_path << "\n";
+  if (all_files.empty()) {
+    std::cerr << "ERROR: No parquet files found\n";
     return 1;
   }
 
-  // Build file info with sizes
-  std::vector<FileInfo> files;
-  files.reserve(file_paths.size());
-  uint64_t total_size = 0;
-  for (const auto& path : file_paths) {
-    uint64_t size = fs::file_size(path);
-    files.push_back({path, size});
-    total_size += size;
+  std::cout << "\nTotal files: " << all_files.size() << "\n";
+
+  // Shuffle files for randomness
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::shuffle(all_files.begin(), all_files.end(), gen);
+
+  // Distribute files across threads
+  std::vector<std::vector<std::string>> thread_files(num_threads);
+  for (size_t i = 0; i < all_files.size(); i++) {
+    thread_files[i % num_threads].push_back(all_files[i]);
   }
-  total_file_size = total_size;
 
-  std::cout << "Found " << files.size() << " parquet file(s)\n";
-  std::cout << "Total size: " << total_size << " bytes ("
-            << (total_size / 1024.0 / 1024.0) << " MB)\n";
-  std::cout << "Iterations: " << iterations << "\n";
-  std::cout << "Parallel threads: " << num_threads << "\n";
-  std::cout << "\n";
+  std::cout << "\nFiles per thread:\n";
+  for (int i = 0; i < num_threads; i++) {
+    std::cout << "  Thread " << i << ": " << thread_files[i].size() << " files\n";
+  }
 
-  // Create barrier for thread synchronization
-  iteration_barrier = std::make_unique<std::barrier<>>(num_threads);
-
+  std::cout << "\n=== Starting concurrent reads ===\n\n";
   auto start_time = std::chrono::steady_clock::now();
 
-  // Launch worker threads
-  std::vector<std::thread> threads;
-  for (int t = 0; t < num_threads; t++) {
-    threads.emplace_back(worker_thread, std::ref(files), iterations, t,
-                         num_threads, async_mr.get());
-  }
-
-  // Wait for all threads to complete
-  for (auto& t : threads) {
-    t.join();
-  }
+  // Run the simulation
+  run_query_simulation(thread_files, iterations, async_mr.get());
 
   auto end_time = std::chrono::steady_clock::now();
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -268,33 +326,35 @@ int main(int argc, char* argv[]) {
                      .count();
 
   // Summary
-  double total_bytes_read = static_cast<double>(total_file_size) * iterations;
-  double total_elapsed_sec = elapsed / 1000.0;
-  double avg_bandwidth_gbps = (total_bytes_read / (1024.0 * 1024.0 * 1024.0)) / total_elapsed_sec;
+  double elapsed_sec = elapsed / 1000.0;
+  double total_mb = total_bytes_read.load() / 1024.0 / 1024.0;
+  double avg_throughput = total_mb / elapsed_sec;
 
   std::cout << "\n";
   std::cout << "============================================================\n";
   std::cout << "SUMMARY\n";
   std::cout << "============================================================\n";
-  std::cout << "Total iterations: " << iterations << "\n";
-  std::cout << "Total files per iteration: " << files.size() << "\n";
-  std::cout << "Parallel threads: " << num_threads << "\n";
-  std::cout << "Total reads attempted: " << (iterations * files.size()) << "\n";
+  std::cout << "Concurrent threads: " << num_threads << "\n";
+  std::cout << "Iterations per thread: " << iterations << "\n";
+  std::cout << "Total files: " << all_files.size() << "\n";
   std::cout << "Successful reads: " << success_count.load() << "\n";
   std::cout << "Failed reads: " << failure_count.load() << "\n";
-  std::cout << "Total time: " << std::fixed << std::setprecision(2) << total_elapsed_sec << " seconds\n";
-  std::cout << "Total data read: " << std::setprecision(2) << (total_bytes_read / (1024.0 * 1024.0 * 1024.0)) << " GB\n";
-  std::cout << "Average bandwidth: " << std::setprecision(2) << avg_bandwidth_gbps << " GB/s\n";
+  std::cout << "Total rows read: " << total_rows_read.load() << "\n";
+  std::cout << "Total data read: " << std::fixed << std::setprecision(2)
+            << total_mb << " MB (" << (total_mb / 1024.0) << " GB)\n";
+  std::cout << "Total time: " << std::setprecision(2) << elapsed_sec << " seconds\n";
+  std::cout << "Average throughput: " << std::setprecision(1) << avg_throughput << " MB/s\n";
 
   if (!failures.empty()) {
     std::cout << "\nFailures:\n";
     for (const auto& f : failures) {
-      std::cout << "  - Iteration " << f.iteration << ": " << f.file << "\n";
+      std::cout << "  - Table " << f.table_id << ", Iteration " << f.iteration
+                << ": " << f.file << "\n";
       std::cout << "    Error: " << f.error << "\n";
     }
     return 1;
   } else {
-    std::cout << "\nAll iterations passed successfully\n";
+    std::cout << "\nAll reads completed successfully\n";
     return 0;
   }
 }

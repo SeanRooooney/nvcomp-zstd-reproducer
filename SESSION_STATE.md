@@ -154,12 +154,11 @@ The bug is likely in cuDF's Parquet reader or nvCOMP when:
 
 ## Files in This Repo
 
-- `reproducer.cpp` - Original simple reproducer (does NOT trigger bug)
-- `reproducer_velox_pattern.cpp` - Velox-pattern reproducer (**TRIGGERS bug**)
-- `reproducer.py` - Python cuDF reproducer (does NOT trigger bug)
+- `reproducer.cpp` - Velox-pattern reproducer (**TRIGGERS bug**)
 - `CMakeLists.txt` - CMake build configuration
 - `build.sh` - Build script for Prestissimo environment
 - `SESSION_STATE.md` - This file
+- `README.md` - Quick start guide
 
 ## Useful Commands
 
@@ -167,27 +166,21 @@ The bug is likely in cuDF's Parquet reader or nvCOMP when:
 # Build reproducers
 ./build.sh /prestissimo
 
-# Run Velox-pattern reproducer (triggers bug)
-./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
+# Run reproducer (triggers bug)
+./build/reproducer /path/to/zstd-parquet-files --iterations 50 --threads 5
 
-# Run on a specific GPU (use CUDA_VISIBLE_DEVICES, not --gpu flag)
-CUDA_VISIBLE_DEVICES=2 ./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
+# Run on a specific GPU (use CUDA_VISIBLE_DEVICES)
+CUDA_VISIBLE_DEVICES=2 ./build/reproducer /path/to/zstd-parquet-files --iterations 50 --threads 5
 
 # Run in a loop to reliably trigger the bug
 for i in {1..100}; do
   echo "=== Run $i ==="
-  ./build/reproducer_velox_pattern /path/to/zstd-parquet-files --iterations 50 --threads 5
+  ./build/reproducer /path/to/zstd-parquet-files --iterations 50 --threads 5
   if [ $? -ne 0 ]; then echo "FAILED on run $i"; break; fi
 done
 
 # Test a specific file in isolation (to confirm it's not corrupt)
-./build/reproducer_velox_pattern /path/to/specific/dir --iterations 100 --threads 1
-
-# Run simple reproducer (does not trigger bug)
-./build/reproducer /path/to/zstd-parquet-files 100 8
-
-# Run Python reproducer (does not trigger bug)
-python reproducer.py /path/to/zstd-parquet-files --iterations 100 --parallel 8
+./build/reproducer /path/to/specific/dir --iterations 100 --threads 1
 ```
 
 **Note:** The `--gpu` flag does not work reliably because cuDF's internal singletons initialize on GPU 0. Use `CUDA_VISIBLE_DEVICES` environment variable instead.
