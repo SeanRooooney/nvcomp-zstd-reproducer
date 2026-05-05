@@ -23,19 +23,24 @@ We have successfully reproduced the intermittent ZSTD decompression failure **ou
 
 **Typical failure point:** iteration 17-30+ (~100k-200k file reads, ~250-500 GB data)
 
-### Three Failure Modes (Same Underlying Bug)
+### Four Failure Modes (Same Underlying Bug)
 
 1. **"Error during decompression"** - cuDF catches the error
    ```
    CUDF failure at: .../reader_impl_chunking_utils.cu:622: Error during decompression
    ```
 
-2. **cudaErrorIllegalAddress** - Memory corruption crashes the process
+2. **"Page offsets mismatch"** - Corrupted metadata/reader state
+   ```
+   CUDF failure at: .../reader_impl_preprocess.cu:559: Encountered page_offsets / num_columns mismatch
+   ```
+
+3. **cudaErrorIllegalAddress** - Memory corruption crashes the process
    ```
    CUDA Error detected. cudaErrorIllegalAddress an illegal memory access was encountered
    ```
 
-3. **Hang** - Process stuck at 100% GPU utilization, no progress (infinite loop or deadlock)
+4. **Hang** - Process stuck at 100% GPU utilization, no progress (infinite loop or deadlock)
 
 ### Confirmation that Files are NOT Corrupt
 
