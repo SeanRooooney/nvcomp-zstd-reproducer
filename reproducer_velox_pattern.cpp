@@ -44,6 +44,8 @@ std::mutex cout_mutex;
 std::atomic<int> failure_count{0};
 std::atomic<int> success_count{0};
 std::atomic<bool> stop_flag{false};
+std::atomic<int64_t> total_bytes_read{0};
+std::atomic<int64_t> total_rows_read{0};
 
 struct FailureInfo {
   int table_id;
@@ -89,14 +91,26 @@ public:
       : table_id_(table_id), files_(files), mr_(mr) {}
 
   void run(int iterations) {
+    auto table_start = std::chrono::steady_clock::now();
+
     for (int iter = 1; iter <= iterations && !stop_flag; iter++) {
+      auto iter_start = std::chrono::steady_clock::now();
+      int64_t iter_rows = 0;
+      int64_t iter_bytes = 0;
+      int files_this_iter = 0;
+
       // Get a fresh stream from the global pool (like Velox does per split)
       auto stream = cudf::detail::global_cuda_stream_pool().get_stream();
 
       for (const auto& filepath : files_) {
         if (stop_flag) break;
 
+        auto file_start = std::chrono::steady_clock::now();
+
         try {
+          // Get file size for throughput calculation
+          int64_t file_size = fs::file_size(filepath);
+
           // Build parquet reader options
           auto source = cudf::io::source_info(filepath);
           auto builder = cudf::io::parquet_reader_options::builder(source);
@@ -111,15 +125,29 @@ public:
           cudf::io::chunked_parquet_reader reader(
               chunk_read_limit, pass_read_limit, options, stream, mr_);
 
-          int64_t total_rows = 0;
+          int64_t file_rows = 0;
           while (reader.has_next()) {
             auto chunk = reader.read_chunk();
-            total_rows += chunk.tbl->num_rows();
+            file_rows += chunk.tbl->num_rows();
           }
 
+          auto file_end = std::chrono::steady_clock::now();
+          auto file_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             file_end - file_start).count();
+
+          iter_rows += file_rows;
+          iter_bytes += file_size;
+          files_this_iter++;
+
+          total_rows_read += file_rows;
+          total_bytes_read += file_size;
           success_count++;
 
         } catch (const std::exception& e) {
+          auto file_end = std::chrono::steady_clock::now();
+          auto file_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             file_end - file_start).count();
+
           failure_count++;
           stop_flag = true;
 
@@ -130,17 +158,32 @@ public:
           std::cerr << "\n============================================================\n";
           std::cerr << "FAILURE - Table " << table_id_ << ", iteration " << iter << "\n";
           std::cerr << "File: " << filepath << "\n";
+          std::cerr << "Time until failure: " << file_ms << " ms\n";
           std::cerr << "Error: " << e.what() << "\n";
           std::cerr << "============================================================\n\n";
           return;
         }
       }
 
-      // Report progress periodically
-      if (iter % 10 == 0 || iter == iterations) {
+      auto iter_end = std::chrono::steady_clock::now();
+      auto iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         iter_end - iter_start).count();
+      double iter_throughput_mb = (iter_bytes / 1024.0 / 1024.0) / (iter_ms / 1000.0);
+
+      // Report progress every iteration with timing
+      {
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Table " << table_id_ << ": completed iteration " << iter
-                  << "/" << iterations << "\n";
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           iter_end - table_start).count();
+        std::cout << "[T" << table_id_ << "] iter " << iter << "/" << iterations
+                  << " | " << files_this_iter << " files"
+                  << " | " << iter_rows << " rows"
+                  << " | " << std::fixed << std::setprecision(1)
+                  << (iter_bytes / 1024.0 / 1024.0) << " MB"
+                  << " | " << iter_ms << " ms"
+                  << " | " << std::setprecision(1) << iter_throughput_mb << " MB/s"
+                  << " | elapsed " << elapsed << "s"
+                  << "\n";
       }
     }
   }
@@ -275,6 +318,10 @@ int main(int argc, char* argv[]) {
                      .count();
 
   // Summary
+  double elapsed_sec = elapsed / 1000.0;
+  double total_mb = total_bytes_read.load() / 1024.0 / 1024.0;
+  double avg_throughput = total_mb / elapsed_sec;
+
   std::cout << "\n";
   std::cout << "============================================================\n";
   std::cout << "SUMMARY\n";
@@ -284,8 +331,11 @@ int main(int argc, char* argv[]) {
   std::cout << "Total files: " << all_files.size() << "\n";
   std::cout << "Successful reads: " << success_count.load() << "\n";
   std::cout << "Failed reads: " << failure_count.load() << "\n";
-  std::cout << "Total time: " << std::fixed << std::setprecision(2)
-            << (elapsed / 1000.0) << " seconds\n";
+  std::cout << "Total rows read: " << total_rows_read.load() << "\n";
+  std::cout << "Total data read: " << std::fixed << std::setprecision(2)
+            << total_mb << " MB (" << (total_mb / 1024.0) << " GB)\n";
+  std::cout << "Total time: " << std::setprecision(2) << elapsed_sec << " seconds\n";
+  std::cout << "Average throughput: " << std::setprecision(1) << avg_throughput << " MB/s\n";
 
   if (!failures.empty()) {
     std::cout << "\nFailures:\n";
