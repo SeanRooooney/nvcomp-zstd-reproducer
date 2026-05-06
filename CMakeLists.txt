@@ -23,7 +23,7 @@ if(NOT rmm_FOUND)
 endif()
 
 # Create executable
-add_executable(reproducer reproducer_velox_pattern.cpp)
+add_executable(reproducer reproducer.cpp)
 
 if(cudf_FOUND)
   target_link_libraries(reproducer PRIVATE cudf::cudf)
