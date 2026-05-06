@@ -20,6 +20,7 @@ endif()
 if(NOT rmm_FOUND)
   message(STATUS "rmm not found via CMake, using manual paths")
   set(RMM_INCLUDE_DIR "/usr/local/include" CACHE PATH "rmm include directory")
+  set(RMM_LIBRARY "/usr/local/lib/librmm.so" CACHE FILEPATH "rmm library")
 endif()
 
 # Create executable
@@ -36,6 +37,7 @@ if(rmm_FOUND)
   target_link_libraries(reproducer PRIVATE rmm::rmm)
 else()
   target_include_directories(reproducer PRIVATE ${RMM_INCLUDE_DIR})
+  target_link_libraries(reproducer PRIVATE ${RMM_LIBRARY})
 endif()
 
 target_link_libraries(reproducer PRIVATE CUDA::cudart)
